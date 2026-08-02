@@ -1,67 +1,89 @@
-name: Auto Unzip Any Archive
+name: Build & Release Unsigned IPA
 
 on:
+  workflow_dispatch: # ปุ่มกดสั่งรันเองแบบ Manual ใน GitHub
   push:
-    paths:
-      - '**.zip'
-
-permissions:
-  contents: write
+    branches:
+      - release    # รันอัตโนมัติเมื่อมีการ Push โค้ดไปที่ branch 'release'
 
 jobs:
-  unzip-and-clean:
-    runs-on: ubuntu-latest
+  build-and-release:
+    runs-on: macos-14 # ใช้ macOS Runner ตามตัวอย่างของคุณ
+
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      # 1. Checkout โค้ดของโปรเจกต์
+      - name: Checkout Repository
+        uses: actions/checkout@v4.1.1
 
-      - name: Extract all zip files to Root
-        run: |
-          for f in *.zip; do
-            [ -e "$f" ] || continue
-            echo "กำลังจัดการแตกไฟล์: $f"
-            
-            # เก็บชื่อไฟล์ดั้งเดิมแบบไม่มีนามสกุล .zip (เช่น Troll) ไว้ใช้ตรวจสอบโฟลเดอร์ย่อย
-            FOLDER_NAME="${f%.zip}"
-            
-            # แตกไฟล์ออกมาไว้ที่ root หลักตรงๆ
-            unzip -o "$f" -d ./
-            rm "$f"
-            
-            # ตรวจสอบว่าถ้าหากเกิดโฟลเดอร์ย่อยขึ้นมา (เช่นมีโฟลเดอร์ชื่อ Troll/ โผล่มาหลังแตกไฟล์)
-            if [ -d "$FOLDER_NAME" ]; then
-               echo "พบโฟลเดอร์ซ้อนชื่อ $FOLDER_NAME -> กำลังบังคับดึงไฟล์ภายในทั้งหมดออกมาที่หน้าแรก"
-               
-               # ดึงข้อมูลทุกอย่าง (รวมไฟล์ปกติและไฟล์ซ่อน) ออกมาที่หน้าแรกหลักของ Repo
-               mv "$FOLDER_NAME"/* ./ 2>/dev/null || true
-               mv "$FOLDER_NAME"/.* ./ 2>/dev/null || true
-               
-               # ลบตัวโฟลเดอร์เปล่าที่เหลือทิ้งไป
-               rm -rf "$FOLDER_NAME"
-            fi
-          done
+      # 2. ตั้งค่า Xcode Version
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '15.4'
 
-      - name: Fallback Check (For any other single nested folder)
-        run: |
-          # บล็อกสำรอง: หากชื่อโฟลเดอร์ย่อยไม่ตรงกับชื่อ zip แต่แตกมาแล้วดันมีแค่โฟลเดอร์เปล่าๆ ตัวเดียวหุ้มอยู่
-          TARGET_DIR=$(ls -d */ 2>/dev/null | grep -v -E '^(.git|.github)/$' | head -n 1)
-          NON_GIT_ITEMS=$(ls -1d */ * 2>/dev/null | grep -v -E '^(.git|.github)' | wc -l)
-          
-          if [ ! -z "$TARGET_DIR" ] && [ "$NON_GIT_ITEMS" -eq 1 ]; then
-             echo "Fallback: ตรวจพบโฟลเดอร์หุ้มชั้นนอกสุดชื่ออื่น: $TARGET_DIR -> กำลังเคลียร์ไฟล์ย่อยออกมา"
-             mv "$TARGET_DIR"* ./ 2>/dev/null || true
-             mv "$TARGET_DIR".* ./ 2>/dev/null || true
-             rm -rf "$TARGET_DIR"
-          fi
+      # 3. ตั้งค่า Java Environment
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
 
-      - name: Commit and Push Changes back to Repo
+      # 4. ตั้งค่า Flutter SDK
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      # 5. ดึง Version จากไฟล์ pubspec.yaml เพื่อนำมาทำ Release Tag
+      - name: Extract Version from pubspec.yaml
+        id: get_version
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .
-          if ! git diff-index --quiet HEAD; then
-            git commit -m "Unpack and force flatten nested zip folder contents to root"
-            git push
-          else
-            echo "ไม่มีการเปลี่ยนแปลงโครงสร้างไฟล์เพิ่มเติม"
-          fi
+          VERSION=$(grep '^version:' pubspec.yaml | cut -d ' ' -f 2 | tr -d '\r')
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Building Version: $VERSION"
+
+      # 6. Install Dependencies
+      - name: Install Flutter Dependencies
+        run: flutter pub get
+
+      # 7. แก้ไข iOS Deployment Target จาก 8.0 เป็น 12.0 ป้องกัน Xcode crash
+      - name: Update iOS Deployment Target
+        run: |
+          sed -i '' 's/IPHONEOS_DEPLOYMENT_TARGET = 8.0;/IPHONEOS_DEPLOYMENT_TARGET = 12.0;/g' ios/Runner.xcodeproj/project.pbxproj
+
+      # 8. Build iOS Bundle แบบ No Code Signing
+      - name: Build Flutter iOS App
+        run: flutter build ios --release --no-codesign
+
+      # 9. Pack ให้เป็นไฟล์ .ipa (ตั้งชื่อไฟล์ตามชื่อโปรเจกต์และเวอร์ชัน)
+      - name: Package to Unsigned IPA
+        run: |
+          mkdir -p Payload
+          mv build/ios/iphoneos/Runner.app Payload/
+          zip -r Payload.zip Payload
+          mv Payload.zip Runner.ipa
+
+      # 10. Upload Artifact เก็บสำรองไว้บน GitHub Actions
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-${{ env.VERSION }}
+          path: Runner.ipa
+
+      # 11. สร้าง GitHub Release และอัปโหลดไฟล์ .ipa เข้าไปใน Release อัตโนมัติ
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: Release v${{ env.VERSION }}
+          body: |
+            ## 📱 Flutter Unsigned IPA Release
+            - **Version:** ${{ env.VERSION }}
+            - **Support:** TrollStore / ESign / Sideload
+            
+            *ไฟล์ IPA นี้สร้างจากระบบ Build อัตโนมัติ (Unsigned) สามารถนำไปติดตั้งผ่าน TrollStore หรือเซ็นสัญญาเพิ่มใน ESign ได้ทันที*
+          draft: false
+          prerelease: false
+          files: |
+            Runner.ipa
